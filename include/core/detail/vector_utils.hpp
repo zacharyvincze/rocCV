@@ -47,4 +47,29 @@ __device__ __host__ constexpr T SetAll(Base v) {
             return (T){v, v, v, v};
     }
 }
+
+/**
+ * @brief Get a value from a LUT.
+ *
+ * @tparam T The vectorized type.
+ * @tparam Base The base type of the vectorized type.
+ * @param[in] value The value to get from the LUT.
+ * @param[in] lut The LUT to get the value from.
+ * @return The value from the LUT.
+ */
+template <typename T, typename Base = BaseType<T>, class = std::enable_if_t<HasTypeTraits<T>>>
+__device__ __host__ T FromLUT(T value, Base* lut) {
+    if constexpr (!IsCompound<T>) {
+        return lut[value];
+    } else {
+        if constexpr (NumElements<T> == 1)
+            return (T){lut[value.x]};
+        else if constexpr (NumElements<T> == 2)
+            return (T){lut[value.x], lut[value.y]};
+        else if constexpr (NumElements<T> == 3)
+            return (T){lut[value.x], lut[value.y], lut[value.z]};
+        else if constexpr (NumElements<T> == 4)
+            return (T){lut[value.x], lut[value.y], lut[value.z], lut[value.w]};
+    }
+}
 }  // namespace roccv::detail

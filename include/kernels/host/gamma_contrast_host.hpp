@@ -23,10 +23,10 @@ THE SOFTWARE.
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include "core/detail/math/vectorized_type_math.hpp"
-#include "core/detail/casting.hpp"
 
-#include "operator_types.h"
+#include "core/detail/casting.hpp"
+#include "core/detail/math/vectorized_type_math.hpp"
+#include "core/detail/vector_utils.hpp"
 
 namespace Kernels {
 namespace Host {
@@ -36,7 +36,7 @@ void gamma_contrast(SrcWrapper input, DstWrapper output, float gamma) {
     using src_type = typename SrcWrapper::ValueType;
     using dst_type = typename DstWrapper::ValueType;
     using work_type = MakeType<float, NumElements<src_type>>;
-    
+
     for (int batch = 0; batch < output.batches(); batch++) {
 #pragma omp parallel for
         for (int y = 0; y < output.height(); y++) {
@@ -44,9 +44,32 @@ void gamma_contrast(SrcWrapper input, DstWrapper output, float gamma) {
                 auto inVal = (RangeCast<work_type>(input.at(batch, y, x, 0)));
                 work_type result = math::vpowf(inVal, gamma);
                 if constexpr (NumElements<dst_type> == 4) {
-                    output.at(batch, y, x, 0) = RangeCast<dst_type>((MakeType<float, 4>){result.x, result.y, result.z, inVal.w});
+                    output.at(batch, y, x, 0) =
+                        RangeCast<dst_type>((MakeType<float, 4>){result.x, result.y, result.z, inVal.w});
                 } else {
                     output.at(batch, y, x, 0) = RangeCast<dst_type>(result);
+                }
+            }
+        }
+    }
+}
+
+template <typename SrcWrapper, typename DstWrapper>
+void gamma_contrast_lut(SrcWrapper input, DstWrapper output, std::array<uint8_t, 256>& lut) {
+    using namespace roccv::detail;  // For FromLUT, NumElements, etc.
+    using work_t = typename DstWrapper::ValueType;
+
+    for (int batch = 0; batch < output.batches(); batch++) {
+#pragma omp parallel for
+        for (int y = 0; y < output.height(); y++) {
+            for (int x = 0; x < output.width(); x++) {
+                work_t inVal = input.at(batch, y, x, 0);
+                work_t outVal = FromLUT(inVal, lut.data());
+
+                if constexpr (NumElements<work_t> == 4) {
+                    output.at(batch, y, x, 0) = (work_t){outVal.x, outVal.y, outVal.z, inVal.w};
+                } else {
+                    output.at(batch, y, x, 0) = outVal;
                 }
             }
         }

@@ -23,26 +23,27 @@ THE SOFTWARE.
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include "core/detail/math/vectorized_type_math.hpp"
-#include "core/detail/casting.hpp"
 
-#include "operator_types.h"
+#include "core/detail/casting.hpp"
+#include "core/detail/math/vectorized_type_math.hpp"
+#include "core/detail/vector_utils.hpp"
 
 namespace Kernels {
 namespace Device {
+
 template <typename SrcWrapper, typename DstWrapper>
 __global__ void gamma_contrast(SrcWrapper input, DstWrapper output, float gamma) {
     using namespace roccv::detail;  // For RangeCast, NumElements, etc.
     using src_type = typename SrcWrapper::ValueType;
     using dst_type = typename DstWrapper::ValueType;
     using work_type = MakeType<float, NumElements<src_type>>;
-    
+
     const int x = threadIdx.x + blockIdx.x * blockDim.x;
     const int y = threadIdx.y + blockIdx.y * blockDim.y;
     const int batch = blockIdx.z;
 
-    if (x >= output.width() || y >= output.height() || batch >= output.batches()) return;
-    
+    if (x >= output.width() || y >= output.height()) return;
+
     auto inVal = (RangeCast<work_type>(input.at(batch, y, x, 0)));
     work_type result = math::vpowf(inVal, gamma);
     if constexpr (NumElements<dst_type> == 4) {
@@ -50,7 +51,26 @@ __global__ void gamma_contrast(SrcWrapper input, DstWrapper output, float gamma)
     } else {
         output.at(batch, y, x, 0) = RangeCast<dst_type>(result);
     }
-    
+}
+
+template <typename SrcWrapper, typename DstWrapper>
+__global__ void gamma_contrast_lut(SrcWrapper input, DstWrapper output, std::array<uint8_t, 256> lut) {
+    using namespace roccv::detail;  // For FromLUT, NumElements, etc.
+    using work_t = typename DstWrapper::ValueType;
+
+    const int x = threadIdx.x + blockIdx.x * blockDim.x;
+    const int y = threadIdx.y + blockIdx.y * blockDim.y;
+    const int batch = blockIdx.z;
+
+    if (x >= output.width() || y >= output.height()) return;
+
+    work_t inVal = input.at(batch, y, x, 0);
+    work_t outVal = FromLUT(inVal, lut.data());
+    if constexpr (NumElements<work_t> == 4) {
+        output.at(batch, y, x, 0) = (work_t){outVal.x, outVal.y, outVal.z, inVal.w};
+    } else {
+        output.at(batch, y, x, 0) = outVal;
+    }
 }
 }  // namespace Device
 }  // namespace Kernels

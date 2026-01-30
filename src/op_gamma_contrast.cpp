@@ -24,14 +24,9 @@ THE SOFTWARE.
 
 #include <hip/hip_runtime.h>
 
-#include <algorithm>
 #include <cstring>
 #include <functional>
-#include <iostream>
-#include <vector>
 
-#include "common/array_wrapper.hpp"
-#include "common/math_vector.hpp"
 #include "common/validation_helpers.hpp"
 #include "core/tensor.hpp"
 #include "core/wrappers/image_wrapper.hpp"
@@ -47,13 +42,47 @@ void dispatch_gamma_contrast_dtype(hipStream_t stream, const Tensor &input, cons
     ImageWrapper<T> outputWrapper(output);
 
     if (device == eDeviceType::GPU) {
-        dim3 block(64, 16);
+        dim3 block(32, 8);
         dim3 grid((outputWrapper.width() + block.x - 1) / block.x, (outputWrapper.height() + block.y - 1) / block.y,
                   outputWrapper.batches());
 
         Kernels::Device::gamma_contrast<<<grid, block, 0, stream>>>(inputWrapper, outputWrapper, gamma);
     } else if (device == eDeviceType::CPU) {
         Kernels::Host::gamma_contrast(inputWrapper, outputWrapper, gamma);
+    }
+}
+
+template <typename T>
+void DispatchGammaContrastLUT(hipStream_t stream, const Tensor &input, const Tensor &output, float gamma,
+                              eDeviceType device) {
+    static_assert(std::is_same_v<detail::BaseType<T>, uint8_t>,
+                  "LUT based gamma contrast is only supported for U8 datatypes");
+
+    ImageWrapper<T> inputWrapper(input);
+    ImageWrapper<T> outputWrapper(output);
+
+    // Precompute the LUT
+    std::array<uint8_t, 256> lut;
+
+    for (size_t i = 0; i < lut.size(); i++) {
+        lut[i] = detail::SaturateCast<uint8_t>(powf(i / 255.0f, gamma) * 255.0f);
+    }
+
+    switch (device) {
+        case eDeviceType::GPU: {
+            dim3 block(32, 8);
+            dim3 grid((outputWrapper.width() + block.x - 1) / block.x, (outputWrapper.height() + block.y - 1) / block.y,
+                      outputWrapper.batches());
+            Kernels::Device::gamma_contrast_lut<<<grid, block, 0, stream>>>(inputWrapper, outputWrapper, lut);
+            break;
+        }
+        case eDeviceType::CPU: {
+            Kernels::Host::gamma_contrast_lut(inputWrapper, outputWrapper, lut);
+            break;
+        }
+        default: {
+            throw std::invalid_argument("Invalid device type for LUT based gamma contrast");
+        }
     }
 }
 
@@ -87,7 +116,7 @@ void GammaContrast::operator()(hipStream_t stream, const Tensor &input, const Te
     eDataType, std::array<std::function<void(hipStream_t, const Tensor &, const Tensor &, float, const eDeviceType)>, 4>>
         funcs = 
         {
-            {eDataType::DATA_TYPE_U8, {dispatch_gamma_contrast_dtype<uchar1>, 0, dispatch_gamma_contrast_dtype<uchar3>, dispatch_gamma_contrast_dtype<uchar4>}},
+            {eDataType::DATA_TYPE_U8, {DispatchGammaContrastLUT<uchar1>, 0, DispatchGammaContrastLUT<uchar3>, DispatchGammaContrastLUT<uchar4>}},
             {eDataType::DATA_TYPE_U16, {dispatch_gamma_contrast_dtype<ushort1>, 0, dispatch_gamma_contrast_dtype<ushort3>, dispatch_gamma_contrast_dtype<ushort4>}},
             {eDataType::DATA_TYPE_U32, {dispatch_gamma_contrast_dtype<uint1>, 0, dispatch_gamma_contrast_dtype<uint3>, dispatch_gamma_contrast_dtype<uint4>}},
             {eDataType::DATA_TYPE_F32, {dispatch_gamma_contrast_dtype<float1>, 0, dispatch_gamma_contrast_dtype<float3>, dispatch_gamma_contrast_dtype<float4>}}
