@@ -41,7 +41,7 @@ void dispatch_composite_masktype(hipStream_t stream, const Tensor& foreground, c
 
     switch (device) {
         case eDeviceType::GPU: {
-            dim3 block(64, 16);
+            dim3 block(32, 8);
             if constexpr (std::is_same_v<SrcType, uchar3> &&
                           (std::is_same_v<DstType, uchar3> || std::is_same_v<DstType, uchar4>)) {
                 const int64_t width = outputWrapper.width();
@@ -53,7 +53,8 @@ void dispatch_composite_masktype(hipStream_t stream, const Tensor& foreground, c
             } else {
                 dim3 grid((outputWrapper.width() + block.x - 1) / block.x,
                           (outputWrapper.height() + block.y - 1) / block.y, outputWrapper.batches());
-                Kernels::Device::composite<<<grid, block, 0, stream>>>(fgWrapper, bgWrapper, maskWrapper, outputWrapper);
+                Kernels::Device::composite<<<grid, block, 0, stream>>>(fgWrapper, bgWrapper, maskWrapper,
+                                                                       outputWrapper);
             }
             break;
         }

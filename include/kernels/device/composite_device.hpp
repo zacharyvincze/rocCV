@@ -135,12 +135,7 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
 
     const int n = width - x0 < 8 ? width - x0 : 8;
 
-    constexpr int64_t kRgbPixelBytes = 3;
-    const int64_t out_pixel_bytes = static_cast<int64_t>(NumElements<dst_type>);
-    const bool dense_rgb = foreground.byte_stride_w() == kRgbPixelBytes && background.byte_stride_w() == kRgbPixelBytes &&
-                           output.byte_stride_w() == out_pixel_bytes;
-
-    if (!dense_rgb || n < 8) {
+    if (n < 8) {
         for (int i = 0; i < n; ++i) {
             const int x = x0 + i;
             auto maskFactor = RangeCast<float1>(mask.at(batch, y, x, 0));
@@ -157,7 +152,6 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
         return;
     }
 
-    // Eight packed RGB pixels occupy 24 contiguous bytes when horizontal pixel stride is 3.
     unsigned char* fg_p = reinterpret_cast<unsigned char*>(&foreground.at(batch, y, x0, 0));
     unsigned char* bg_p = reinterpret_cast<unsigned char*>(&background.at(batch, y, x0, 0));
     unsigned char* out_p = reinterpret_cast<unsigned char*>(&output.at(batch, y, x0, 0));
@@ -180,25 +174,16 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
     }
 
     if constexpr (NumElements<dst_type> == 3) {
-        const bool aligned_out = (reinterpret_cast<uintptr_t>(out_p) & 3u) == 0;
         unsigned char out_b[24];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const work_type wv = {blended[i].x, blended[i].y, blended[i].z};
-            const uchar3 q = RangeCast<uchar3>(wv);
+            const uchar3 q = RangeCast<uchar3>(blended[i]);
             out_b[i * 3 + 0] = q.x;
             out_b[i * 3 + 1] = q.y;
             out_b[i * 3 + 2] = q.z;
         }
-        if (aligned_out) {
-            detail::store_rgb24_aligned(out_p, out_b);
-        } else {
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const work_type wv = {blended[i].x, blended[i].y, blended[i].z};
-                output.at(batch, y, x0 + i, 0) = RangeCast<dst_type>(wv);
-            }
-        }
+
+        detail::store_rgb24_aligned(out_p, out_b);
     } else {
         static_assert(NumElements<dst_type> == 4, "composite_rgb_u8_packed expects uchar3 or uchar4 output");
 #pragma unroll
