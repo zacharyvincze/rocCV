@@ -165,9 +165,13 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
     detail::unpack_rgb24_to_float01(bg_b, bg_f);
 
     float3 blended[8];
+
+    // Optimization: Load 8 mask bytes at once as a packed value to improve memory latency on GPU
+    uint64_t mask_packed = *reinterpret_cast<const uint64_t*>(&mask.at(batch, y, x0, 0));
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const float m = RangeCast<float1>(mask.at(batch, y, x0 + i, 0)).x;
+        unsigned char mask_byte = (mask_packed >> (i * 8)) & 0xFF;
+        const float m = mask_byte * (1.0f / 255.0f);
         blended[i].x = bg_f[i].x + m * (fg_f[i].x - bg_f[i].x);
         blended[i].y = bg_f[i].y + m * (fg_f[i].y - bg_f[i].y);
         blended[i].z = bg_f[i].z + m * (fg_f[i].z - bg_f[i].z);
