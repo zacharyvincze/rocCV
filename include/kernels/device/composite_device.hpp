@@ -21,7 +21,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <hip/hip_runtime.h>
+#include <type_traits>
 
 #include "core/detail/casting.hpp"
 #include "core/detail/type_traits.hpp"
@@ -67,6 +69,10 @@ using roccv::detail::RangeCast;
 __device__ __forceinline__ void load_rgb24_bytes(const unsigned char* p, unsigned char b[24]) {
     const uintptr_t up = reinterpret_cast<uintptr_t>(p);
     const unsigned phase = static_cast<unsigned>(up & 3u);
+    if (phase == 0) {
+        __builtin_memcpy(b, p, 24);
+        return;
+    }
     const unsigned char* p0 = p - phase;
     const int nw = static_cast<int>((phase + 24u + 3u) >> 2);
     uint32_t w[7];
@@ -87,10 +93,10 @@ __device__ __forceinline__ void unpack_rgb24_to_float01(const unsigned char b[24
     constexpr float inv = 1.f / 255.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const unsigned r = b[i * 3 + 0];
-        const unsigned g = b[i * 3 + 1];
-        const unsigned bl = b[i * 3 + 2];
-        out[i] = make_float3(static_cast<float>(r) * inv, static_cast<float>(g) * inv, static_cast<float>(bl) * inv);
+        const uint32_t r = static_cast<uint32_t>(b[i * 3 + 0]);
+        const uint32_t g = static_cast<uint32_t>(b[i * 3 + 1]);
+        const uint32_t bl = static_cast<uint32_t>(b[i * 3 + 2]);
+        out[i] = make_float3(__uint2float_rn(r) * inv, __uint2float_rn(g) * inv, __uint2float_rn(bl) * inv);
     }
 }
 
@@ -108,6 +114,14 @@ __device__ __forceinline__ void store_rgb24_aligned(unsigned char* p, const unsi
              (static_cast<uint32_t>(b[19]) << 24);
     dst[5] = static_cast<uint32_t>(b[20]) | (static_cast<uint32_t>(b[21]) << 8) | (static_cast<uint32_t>(b[22]) << 16) |
              (static_cast<uint32_t>(b[23]) << 24);
+}
+
+__device__ __forceinline__ void store_rgb24_bytes(unsigned char* p, const unsigned char b[24]) {
+    if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0) {
+        store_rgb24_aligned(p, b);
+    } else {
+        __builtin_memcpy(p, b, 24);
+    }
 }
 
 }  // namespace detail
@@ -166,15 +180,31 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
 
     float3 blended[8];
 
-    // Optimization: Load 8 mask bytes at once as a packed value to improve memory latency on GPU
-    uint64_t mask_packed = *reinterpret_cast<const uint64_t*>(&mask.at(batch, y, x0, 0));
+    using mask_type = typename MaskWrapper::ValueType;
+    if constexpr (std::is_same_v<mask_type, uchar1>) {
+        unsigned char mask_u8[8];
+        __builtin_memcpy(mask_u8, &mask.at(batch, y, x0, 0), 8);
+        constexpr float inv255 = 1.0f / 255.0f;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        unsigned char mask_byte = (mask_packed >> (i * 8)) & 0xFF;
-        const float m = mask_byte * (1.0f / 255.0f);
-        blended[i].x = bg_f[i].x + m * (fg_f[i].x - bg_f[i].x);
-        blended[i].y = bg_f[i].y + m * (fg_f[i].y - bg_f[i].y);
-        blended[i].z = bg_f[i].z + m * (fg_f[i].z - bg_f[i].z);
+        for (int i = 0; i < 8; ++i) {
+            const float m = __uint2float_rn(static_cast<uint32_t>(mask_u8[i])) * inv255;
+            blended[i].x = fmaf(m, fg_f[i].x - bg_f[i].x, bg_f[i].x);
+            blended[i].y = fmaf(m, fg_f[i].y - bg_f[i].y, bg_f[i].y);
+            blended[i].z = fmaf(m, fg_f[i].z - bg_f[i].z, bg_f[i].z);
+        }
+    } else if constexpr (std::is_same_v<mask_type, float1>) {
+        float mask_f[8];
+        __builtin_memcpy(mask_f, &mask.at(batch, y, x0, 0), sizeof(mask_f));
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float m = mask_f[i];
+            blended[i].x = fmaf(m, fg_f[i].x - bg_f[i].x, bg_f[i].x);
+            blended[i].y = fmaf(m, fg_f[i].y - bg_f[i].y, bg_f[i].y);
+            blended[i].z = fmaf(m, fg_f[i].z - bg_f[i].z, bg_f[i].z);
+        }
+    } else {
+        static_assert(std::is_same_v<mask_type, uchar1> || std::is_same_v<mask_type, float1>,
+                      "composite_rgb_u8_packed supports uchar1 or float1 masks only");
     }
 
     if constexpr (NumElements<dst_type> == 3) {
@@ -187,7 +217,7 @@ __global__ void composite_rgb_u8_packed(roccv::ImageWrapper<uchar3> foreground, 
             out_b[i * 3 + 2] = q.z;
         }
 
-        detail::store_rgb24_aligned(out_p, out_b);
+        detail::store_rgb24_bytes(out_p, out_b);
     } else {
         static_assert(NumElements<dst_type> == 4, "composite_rgb_u8_packed expects uchar3 or uchar4 output");
 #pragma unroll
