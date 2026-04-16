@@ -164,6 +164,9 @@ class ImageWrapper {
      */
     __device__ __host__ inline int64_t channels() const { return shape.c; }
 
+    /** Byte offset between horizontally adjacent pixels (same as stride along the layout width index). */
+    __device__ __host__ inline int64_t byte_stride_w() const { return stride.w; }
+
    private:
     struct ImageShape {
         int64_t n, h, w, c;

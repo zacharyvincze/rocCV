@@ -22,6 +22,7 @@
 #include "op_composite.hpp"
 
 #include <functional>
+#include <type_traits>
 
 #include "common/validation_helpers.hpp"
 #include "core/wrappers/image_wrapper.hpp"
@@ -41,9 +42,19 @@ void dispatch_composite_masktype(hipStream_t stream, const Tensor& foreground, c
     switch (device) {
         case eDeviceType::GPU: {
             dim3 block(64, 16);
-            dim3 grid((outputWrapper.width() + block.x - 1) / block.x, (outputWrapper.height() + block.y - 1) / block.y,
-                      outputWrapper.batches());
-            Kernels::Device::composite<<<grid, block, 0, stream>>>(fgWrapper, bgWrapper, maskWrapper, outputWrapper);
+            if constexpr (std::is_same_v<SrcType, uchar3> &&
+                          (std::is_same_v<DstType, uchar3> || std::is_same_v<DstType, uchar4>)) {
+                const int64_t width = outputWrapper.width();
+                const int tiles_x = static_cast<int>((width + 7) / 8);
+                dim3 grid((tiles_x + block.x - 1) / block.x, (outputWrapper.height() + block.y - 1) / block.y,
+                          outputWrapper.batches());
+                Kernels::Device::composite_rgb_u8_packed<<<grid, block, 0, stream>>>(fgWrapper, bgWrapper, maskWrapper,
+                                                                                     outputWrapper);
+            } else {
+                dim3 grid((outputWrapper.width() + block.x - 1) / block.x,
+                          (outputWrapper.height() + block.y - 1) / block.y, outputWrapper.batches());
+                Kernels::Device::composite<<<grid, block, 0, stream>>>(fgWrapper, bgWrapper, maskWrapper, outputWrapper);
+            }
             break;
         }
 
