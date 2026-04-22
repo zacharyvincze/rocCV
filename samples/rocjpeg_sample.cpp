@@ -24,19 +24,11 @@
 
 namespace {
 
-// =====================================================================================================================
-// Constants
-// =====================================================================================================================
-
 /** Default subdirectory (created in the current working directory) for flipped + resized outputs. */
 constexpr const char* kDefaultOutputDirName = "rocjpeg_flipped_output";
 
 /** Output upscale factor applied by the resize operator after flipping. */
 constexpr int kResizeFactor = 2;
-
-// =====================================================================================================================
-// Timing helpers
-// =====================================================================================================================
 
 using Clock = std::chrono::steady_clock;
 
@@ -61,10 +53,6 @@ void PrintTiming(const char* label, double ms) {
     std::cout << "  " << std::left << std::setw(28) << label << std::right << std::fixed << std::setprecision(3)
               << std::setw(10) << ms << " ms" << std::endl;
 }
-
-// =====================================================================================================================
-// Path / CLI helpers
-// =====================================================================================================================
 
 /**
  * @brief Builds an output path of the form `<output_dir>/<input_stem>_flipped.png`.
@@ -127,15 +115,10 @@ std::vector<std::string> ResolveInputPaths(const std::string& input_arg) {
         if (paths.empty()) {
             throw std::runtime_error("No .jpg/.jpeg files found in directory: " + input_arg);
         }
-        std::cout << "Batch decoding " << paths.size() << " images from " << input_arg << std::endl;
         return paths;
     }
     return {input_arg};
 }
-
-// =====================================================================================================================
-// Tensor → image-file I/O
-// =====================================================================================================================
 
 /**
  * @brief Copies a single image (slice `batch_idx`) of an NHWC U8 tensor from device memory to host and writes it as an
@@ -192,10 +175,6 @@ void WriteTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, con
 
 }  // namespace
 
-// =====================================================================================================================
-// Entry point
-// =====================================================================================================================
-
 int main(int argc, char** argv) {
     // Help flag — checked before arg-count validation so `--help` works regardless of position.
     for (int i = 1; i < argc; ++i) {
@@ -218,17 +197,17 @@ int main(int argc, char** argv) {
     try {
         EnsureOutputDirectory(output_dir);
 
-        // ----------------------------------------------------------------------------------------- rocJPEG init
+        // Initialize rocJPEG loader
+        std::cout << "Initializing rocJPEG loader" << std::endl;
         const auto t_loader_start = Clock::now();
         RocJpegLoader loader(ROCJPEG_BACKEND_HARDWARE, 0);
         const auto t_loader_end = Clock::now();
 
-        // ----------------------------------------------------------------------------------------- list inputs
-        const auto t_list_start = Clock::now();
+        // List input files
         const std::vector<std::string> input_paths = ResolveInputPaths(input_arg);
-        const auto t_list_end = Clock::now();
 
-        // ----------------------------------------------------------------------------------------- decode (batched)
+        // Batch decode images into a single tensor
+        std::cout << "Decoding images into input tensor" << std::endl;
         const auto t_decode_start = Clock::now();
         roccv::Tensor input_tensor = loader.loadTensor(input_paths);
         const auto t_decode_end = Clock::now();
@@ -237,7 +216,8 @@ int main(int argc, char** argv) {
         const int width = static_cast<int>(input_tensor.shape("W"));
         const int height = static_cast<int>(input_tensor.shape("H"));
 
-        // ----------------------------------------------------------------------------------------- alloc outputs
+        // Allocate output tensors
+        std::cout << "Allocating output tensors" << std::endl;
         const auto t_alloc_start = Clock::now();
         roccv::Tensor flipped_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_RGB8, eDeviceType::GPU);
         roccv::Tensor grayscale_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_U8, eDeviceType::GPU);
@@ -248,7 +228,8 @@ int main(int argc, char** argv) {
         hipStream_t stream{};
         HIP_VALIDATE_NO_ERRORS(hipStreamCreate(&stream));
 
-        // ----------------------------------------------------------------------------------------- flip + resize
+        // Image preprocessing
+        std::cout << "Preprocessing images" << std::endl;
         roccv::Flip flip;
         roccv::CvtColor cvt_color;
         roccv::Resize resize;
@@ -262,16 +243,18 @@ int main(int argc, char** argv) {
 
         HIP_VALIDATE_NO_ERRORS(hipStreamDestroy(stream));
 
-        // ----------------------------------------------------------------------------------------- write outputs
+        // Write output images
+        std::cout << "Writing output images" << std::endl;
         const auto t_write_start = Clock::now();
         for (int i = 0; i < batch; ++i) {
             const std::string output_path = FlippedOutputPath(input_paths[i], output_dir);
             WriteTensorSliceToImageFile(resized_tensor, i, output_path);
         }
         const auto t_write_end = Clock::now();
-        std::cout << "Wrote " << batch << " images to " << output_dir.string() << std::endl;
+        std::cout << "Done! Wrote " << batch << " images to " << std::filesystem::absolute(output_dir).string()
+                  << std::endl;
 
-        // ----------------------------------------------------------------------------------------- timing summary
+        // Timing summary
         const double decode_ms = ElapsedMs(t_decode_start, t_decode_end);
         const double ops_ms = ElapsedMs(t_ops_start, t_ops_end);
         const double write_ms = ElapsedMs(t_write_start, t_write_end);
@@ -280,7 +263,6 @@ int main(int argc, char** argv) {
         std::cout << "\nTimings (" << batch << " image" << (batch == 1 ? "" : "s") << " @ " << width << "x" << height
                   << "):" << std::endl;
         PrintTiming("rocJPEG init", ElapsedMs(t_loader_start, t_loader_end));
-        PrintTiming("List inputs", ElapsedMs(t_list_start, t_list_end));
         PrintTiming("Decode (batched)", decode_ms);
         PrintTiming("  per image", decode_ms / batch);
         PrintTiming("Output tensor alloc", ElapsedMs(t_alloc_start, t_alloc_end));

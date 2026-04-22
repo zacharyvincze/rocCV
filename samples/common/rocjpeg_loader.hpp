@@ -6,25 +6,20 @@
  *        tensor via the batched rocJPEG API. Header-only for easy reuse from samples.
  */
 
-#include <rocjpeg/rocjpeg.h>
-
 #include <core/hip_assert.h>
-#include <core/image_format.hpp>
-#include <core/tensor.hpp>
-#include <core/tensor_data.hpp>
 #include <operator_types.h>
+#include <rocjpeg/rocjpeg.h>
 
 #include <algorithm>
 #include <cctype>
+#include <core/image_format.hpp>
+#include <core/tensor.hpp>
+#include <core/tensor_data.hpp>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-// =====================================================================================================================
-// Public API
-// =====================================================================================================================
 
 /**
  * @class RocJpegLoader
@@ -36,8 +31,6 @@
  */
 class RocJpegLoader {
    public:
-    // ------------------------------------------------------------------------------------------------- Construction
-
     /**
      * @brief Creates a rocJPEG decoder bound to the given backend and HIP device.
      *
@@ -56,8 +49,6 @@ class RocJpegLoader {
     RocJpegLoader(RocJpegLoader&& other) noexcept;
     RocJpegLoader& operator=(RocJpegLoader&& other) noexcept;
 
-    // ------------------------------------------------------------------------------------------------- Decode
-
     /**
      * @brief Decodes one or more JPEGs in a single batched rocJPEG call into an NHWC GPU tensor.
      *
@@ -71,11 +62,8 @@ class RocJpegLoader {
      * @return NHWC GPU tensor with shape `{N, H, W, C}`.
      * @throws std::runtime_error On I/O errors, parse failures, dimension mismatches, or rocJPEG errors.
      */
-    roccv::Tensor loadTensor(const std::vector<std::string>& image_paths,
-                             roccv::ImageFormat fmt = roccv::FMT_RGB8,
+    roccv::Tensor loadTensor(const std::vector<std::string>& image_paths, roccv::ImageFormat fmt = roccv::FMT_RGB8,
                              RocJpegOutputFormat output_format = ROCJPEG_OUTPUT_RGB);
-
-    // ------------------------------------------------------------------------------------------------- Helpers
 
     /**
      * @brief Lists `.jpg`/`.jpeg` files (case-insensitive extension) directly within `directory`, sorted by filename.
@@ -92,8 +80,6 @@ class RocJpegLoader {
     int deviceId() const { return m_device_id; }
 
    private:
-    // ------------------------------------------------------------------------------------------------- Internals
-
     /** @brief Releases all rocJPEG handles. Idempotent — safe to call after a move-from. */
     void release() noexcept;
 
@@ -111,10 +97,6 @@ class RocJpegLoader {
     int m_device_id = 0;
     bool m_valid = false;
 };
-
-// =====================================================================================================================
-// Construction / destruction / move
-// =====================================================================================================================
 
 inline RocJpegLoader::RocJpegLoader(RocJpegBackend backend, int device_id) : m_device_id(device_id) {
     HIP_VALIDATE_NO_ERRORS(hipSetDevice(device_id));
@@ -174,10 +156,6 @@ inline void RocJpegLoader::ensureStreamPool(size_t count) {
         m_stream_pool.push_back(h);
     }
 }
-
-// =====================================================================================================================
-// Decode internals
-// =====================================================================================================================
 
 namespace rocjpeg_loader_detail {
 
@@ -258,8 +236,7 @@ inline roccv::Tensor RocJpegLoader::loadTensor(const std::vector<std::string>& i
         const std::string& image_path = image_paths[i];
         file_buffers[i] = ReadFileBytes(image_path);
 
-        const RocJpegStatus st =
-            rocJpegStreamParse(file_buffers[i].data(), file_buffers[i].size(), m_stream_pool[i]);
+        const RocJpegStatus st = rocJpegStreamParse(file_buffers[i].data(), file_buffers[i].size(), m_stream_pool[i]);
         if (st != ROCJPEG_STATUS_SUCCESS) {
             throw std::runtime_error(std::string("rocJpegStreamParse failed for ") + image_path + ": " +
                                      rocJpegGetErrorName(st));
@@ -306,10 +283,6 @@ inline roccv::Tensor RocJpegLoader::loadTensor(const std::vector<std::string>& i
 
     return tensor;
 }
-
-// =====================================================================================================================
-// Static helpers
-// =====================================================================================================================
 
 inline std::vector<std::string> RocJpegLoader::listJpegFiles(const std::string& directory) {
     namespace fs = std::filesystem;
