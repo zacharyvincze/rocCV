@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <op_cvt_color.hpp>
 #include <op_flip.hpp>
 #include <op_resize.hpp>
 #include <opencv2/opencv.hpp>
@@ -137,15 +138,18 @@ std::vector<std::string> ResolveInputPaths(const std::string& input_arg) {
 // =====================================================================================================================
 
 /**
- * @brief Copies a single image (slice `batch_idx`) of an NHWC RGB8 tensor from device memory to host and writes it as
- *        an image file via OpenCV (output is converted from RGB to BGR before writing).
+ * @brief Copies a single image (slice `batch_idx`) of an NHWC U8 tensor from device memory to host and writes it as an
+ *        image file via OpenCV.
  *
- * @param tensor    NHWC RGB8 source tensor on the GPU.
+ * Supports both 3-channel RGB8 (converted to BGR before writing, since OpenCV uses BGR ordering on disk) and 1-channel
+ * grayscale U8 (written as-is). Any other channel count throws.
+ *
+ * @param tensor    NHWC U8 source tensor on the GPU (1 or 3 channels).
  * @param batch_idx Zero-based index of the image within the batch to write.
  * @param path      Destination image path (extension determines the encoder used by OpenCV).
- * @throws std::runtime_error If OpenCV fails to write the file.
+ * @throws std::runtime_error If the channel count is unsupported or OpenCV fails to write the file.
  */
-void WriteRgbTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, const std::string& path) {
+void WriteTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, const std::string& path) {
     auto data = tensor.exportData<roccv::TensorDataStrided>();
     const auto& layout = tensor.layout();
     const int h = static_cast<int>(tensor.shape(layout.height_index()));
@@ -154,15 +158,34 @@ void WriteRgbTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, 
     const size_t src_pitch = static_cast<size_t>(data.stride(layout.height_index()));
     const size_t row_bytes = static_cast<size_t>(w * c) * tensor.dtype().size();
 
+    int cv_type = 0;
+    switch (c) {
+        case 1:
+            cv_type = CV_8UC1;
+            break;
+        case 3:
+            cv_type = CV_8UC3;
+            break;
+        default:
+            throw std::runtime_error("WriteTensorSliceToImageFile: unsupported channel count " + std::to_string(c) +
+                                     " (expected 1 or 3)");
+    }
+
     auto* base =
         static_cast<uint8_t*>(data.basePtr()) + static_cast<int64_t>(batch_idx) * data.stride(layout.batch_index());
 
-    cv::Mat rgb(h, w, CV_8UC3);
-    HIP_VALIDATE_NO_ERRORS(hipMemcpy2D(rgb.data, rgb.step[0], base, src_pitch, row_bytes, h, hipMemcpyDeviceToHost));
+    cv::Mat host(h, w, cv_type);
+    HIP_VALIDATE_NO_ERRORS(hipMemcpy2D(host.data, host.step[0], base, src_pitch, row_bytes, h, hipMemcpyDeviceToHost));
 
-    cv::Mat bgr;
-    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
-    if (!cv::imwrite(path, bgr)) {
+    // OpenCV expects BGR ordering on disk for color images; grayscale is written as-is.
+    cv::Mat to_write;
+    if (c == 3) {
+        cv::cvtColor(host, to_write, cv::COLOR_RGB2BGR);
+    } else {
+        to_write = host;
+    }
+
+    if (!cv::imwrite(path, to_write)) {
         throw std::runtime_error("OpenCV failed to write image: " + path);
     }
 }
@@ -217,8 +240,9 @@ int main(int argc, char** argv) {
         // ----------------------------------------------------------------------------------------- alloc outputs
         const auto t_alloc_start = Clock::now();
         roccv::Tensor flipped_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_RGB8, eDeviceType::GPU);
-        roccv::Tensor resized_tensor(batch, roccv::Size2D{width * kResizeFactor, height * kResizeFactor},
-                                     roccv::FMT_RGB8, eDeviceType::GPU);
+        roccv::Tensor grayscale_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_U8, eDeviceType::GPU);
+        roccv::Tensor resized_tensor(batch, roccv::Size2D{width * kResizeFactor, height * kResizeFactor}, roccv::FMT_U8,
+                                     eDeviceType::GPU);
         const auto t_alloc_end = Clock::now();
 
         hipStream_t stream{};
@@ -226,11 +250,13 @@ int main(int argc, char** argv) {
 
         // ----------------------------------------------------------------------------------------- flip + resize
         roccv::Flip flip;
+        roccv::CvtColor cvt_color;
         roccv::Resize resize;
 
         const auto t_ops_start = Clock::now();
         flip(stream, input_tensor, flipped_tensor, -1, eDeviceType::GPU);
-        resize(stream, flipped_tensor, resized_tensor, eInterpolationType::INTERP_TYPE_LINEAR, eDeviceType::GPU);
+        cvt_color(stream, flipped_tensor, grayscale_tensor, eColorConversionCode::COLOR_RGB2GRAY, eDeviceType::GPU);
+        resize(stream, grayscale_tensor, resized_tensor, eInterpolationType::INTERP_TYPE_LINEAR, eDeviceType::GPU);
         HIP_VALIDATE_NO_ERRORS(hipStreamSynchronize(stream));
         const auto t_ops_end = Clock::now();
 
@@ -240,7 +266,7 @@ int main(int argc, char** argv) {
         const auto t_write_start = Clock::now();
         for (int i = 0; i < batch; ++i) {
             const std::string output_path = FlippedOutputPath(input_paths[i], output_dir);
-            WriteRgbTensorSliceToImageFile(resized_tensor, i, output_path);
+            WriteTensorSliceToImageFile(resized_tensor, i, output_path);
         }
         const auto t_write_end = Clock::now();
         std::cout << "Wrote " << batch << " images to " << output_dir.string() << std::endl;
@@ -258,7 +284,7 @@ int main(int argc, char** argv) {
         PrintTiming("Decode (batched)", decode_ms);
         PrintTiming("  per image", decode_ms / batch);
         PrintTiming("Output tensor alloc", ElapsedMs(t_alloc_start, t_alloc_end));
-        PrintTiming("Flip + Resize + sync", ops_ms);
+        PrintTiming("Image preprocessing + sync", ops_ms);
         PrintTiming("  per image", ops_ms / batch);
         PrintTiming("Write PNGs", write_ms);
         PrintTiming("  per image", write_ms / batch);
