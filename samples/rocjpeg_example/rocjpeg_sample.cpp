@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "common/rocjpeg_loader.hpp"
+#include "rocjpeg_loader.hpp"
 
 namespace {
 

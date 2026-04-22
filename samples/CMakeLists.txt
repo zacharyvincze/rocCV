@@ -85,11 +85,30 @@ message("-- ${BoldBlue}${PROJECT_NAME} Version -- ${PROJECT_VERSION}${ColorReset
 message("-- ${BoldBlue}${PROJECT_NAME} Build Type -- ${CMAKE_BUILD_TYPE}${ColorReset}")
 message("-- ${BoldBlue}${PROJECT_NAME} Compiler -- ${CMAKE_CXX_COMPILER}${ColorReset}")
 
-# Function for defining a sample executable
-function(define_sample_executable NAME)
-    add_executable(${NAME} ${NAME}.cpp)
-    target_link_libraries(${NAME} PRIVATE roccv::roccv ${OpenCV_LIBS})
-    target_include_directories(${NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
+# Define a sample executable. All samples link against roccv by default.
+#   SOURCES         Source files; defaults to <NAME>.cpp in the current directory.
+#   EXTRA_LIBS      Additional libraries to link.
+#   EXTRA_INCLUDES  Additional include directories.
+#   REQUIRES        Package names (e.g. rocjpeg) whose <NAME>_FOUND must be TRUE;
+#                   samples with unmet requirements are silently skipped.
+function(add_sample NAME)
+    cmake_parse_arguments(SAMPLE "" "" "SOURCES;EXTRA_LIBS;EXTRA_INCLUDES;REQUIRES" ${ARGN})
+
+    foreach(_req IN LISTS SAMPLE_REQUIRES)
+        if (NOT ${_req}_FOUND)
+            message("-- ${Yellow}roccv-samples -- sample ${NAME} requires ${_req} but it was not found, skipping${ColorReset}")
+            return()
+        endif()
+    endforeach()
+
+    if (NOT SAMPLE_SOURCES)
+        set(SAMPLE_SOURCES "${NAME}.cpp")
+    endif()
+
+    message("-- ${Green}roccv-samples -- adding sample ${NAME}${ColorReset}")
+    add_executable(${NAME} ${SAMPLE_SOURCES})
+    target_link_libraries(${NAME} PRIVATE roccv::roccv ${SAMPLE_EXTRA_LIBS})
+    target_include_directories(${NAME} PRIVATE ${SAMPLE_EXTRA_INCLUDES})
     set_target_properties(${NAME} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/samples"
         BUILD_RPATH "$<TARGET_FILE_DIR:roccv::roccv>;${ROCM_PATH}/lib;${ROCM_PATH}/lib/llvm/lib"
@@ -105,40 +124,37 @@ endif()
 find_package(OpenCV QUIET)
 find_package(rocjpeg QUIET)
 
-set(BUILD_SAMPLES ON)
-if (NOT roccv_FOUND)
-    message("-- ${Red}roccv-samples -- require roccv, but it was not found${ColorReset}")
-    set(BUILD_SAMPLES OFF)
-else()
-    message("-- ${Green}roccv-samples -- found roccv version: ${roccv_VERSION}${ColorReset}")
-endif()
-if (NOT OpenCV_FOUND)
-    message("-- ${Red}roccv-samples -- require OpenCV, but it was not found${ColorReset}")
-    set(BUILD_SAMPLES OFF)
-else()
-    message("-- ${Green}roccv-samples -- found OpenCV version: ${OpenCV_VERSION}${ColorReset}")
-endif()
-
-if (BUILD_SAMPLES)
-    define_sample_executable(bilateral_filter)
-    define_sample_executable(custom_crop)
-    define_sample_executable(center_crop)
-    define_sample_executable(normalize)
-    define_sample_executable(bnd_box)
-    define_sample_executable(copy_make_border)
-    define_sample_executable(warp_perspective)
-    define_sample_executable(composite)
-    define_sample_executable(gamma_contrast)
-    add_subdirectory(cropandresize/cpp)
-
-    if (rocjpeg_FOUND)
-        message("-- ${Green}roccv-samples -- found rocjpeg version: ${rocjpeg_VERSION}${ColorReset}")
-        define_sample_executable(rocjpeg_sample)
-        target_link_libraries(rocjpeg_sample PRIVATE rocjpeg::rocjpeg)
-        target_include_directories(rocjpeg_sample PRIVATE ${rocjpeg_INCLUDE_DIR})
-    else()
-        message("-- ${Yellow}roccv-samples -- rocjpeg not found, rocjpeg_sample will not be built${ColorReset}")
+foreach(_pkg IN ITEMS roccv OpenCV rocjpeg)
+    if (${_pkg}_FOUND)
+        message("-- ${Green}roccv-samples -- found ${_pkg} version: ${${_pkg}_VERSION}${ColorReset}")
     endif()
-else()
-    message("-- ${Yellow}roccv-samples -- missing required dependencies, will not be built${ColorReset}")
-endif()
+endforeach()
+
+set(_ocv EXTRA_LIBS ${OpenCV_LIBS} EXTRA_INCLUDES ${OpenCV_INCLUDE_DIRS} REQUIRES roccv OpenCV)
+
+# ================================================
+# rocCV sample executables
+# ================================================
+add_sample(bilateral_filter ${_ocv})
+add_sample(custom_crop ${_ocv})
+add_sample(center_crop ${_ocv})
+add_sample(normalize ${_ocv})
+add_sample(bnd_box ${_ocv})
+add_sample(copy_make_border ${_ocv})
+add_sample(warp_perspective ${_ocv})
+add_sample(composite ${_ocv})
+add_sample(gamma_contrast ${_ocv})
+
+add_sample(roccv_cropandresize_app
+    SOURCES cropandresize/cpp/main.cpp
+    EXTRA_LIBS ${OpenCV_LIBS}
+    EXTRA_INCLUDES ${OpenCV_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}
+    REQUIRES roccv OpenCV
+)
+
+add_sample(rocjpeg_sample
+    SOURCES rocjpeg_example/rocjpeg_sample.cpp
+    EXTRA_LIBS rocjpeg::rocjpeg ${OpenCV_LIBS}
+    EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/rocjpeg_example ${rocjpeg_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS}
+    REQUIRES roccv OpenCV rocjpeg
+)
