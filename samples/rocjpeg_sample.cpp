@@ -1,10 +1,13 @@
 #include <core/hip_assert.h>
 
+#include <chrono>
 #include <core/image_format.hpp>
 #include <core/tensor.hpp>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <op_flip.hpp>
+#include <op_resize.hpp>
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
@@ -41,6 +44,17 @@ std::string FlippedOutputPath(const std::string& input_path, const std::filesyst
 }
 
 constexpr const char* kDefaultOutputDirName = "rocjpeg_flipped_output";
+
+using Clock = std::chrono::steady_clock;
+
+double ElapsedMs(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void PrintTiming(const char* label, double ms) {
+    std::cout << "  " << std::left << std::setw(28) << label << std::right << std::fixed << std::setprecision(3)
+              << std::setw(10) << ms << " ms" << std::endl;
+}
 
 void PrintUsage(const char* prog, std::ostream& os) {
     os << "Usage: " << prog << " <image.jpg|directory> [output_directory]\n"
@@ -88,8 +102,11 @@ int main(int argc, char** argv) {
     }
 
     try {
+        const auto t_loader_start = Clock::now();
         RocJpegLoader loader(ROCJPEG_BACKEND_HARDWARE, 0);
+        const auto t_loader_end = Clock::now();
 
+        const auto t_list_start = Clock::now();
         std::vector<std::string> input_paths;
         if (input_is_directory) {
             input_paths = RocJpegLoader::listJpegFiles(input_arg);
@@ -100,29 +117,59 @@ int main(int argc, char** argv) {
         } else {
             input_paths.push_back(input_arg);
         }
+        const auto t_list_end = Clock::now();
+
+        const auto t_decode_start = Clock::now();
         roccv::Tensor input_tensor = loader.loadTensor(input_paths);
+        const auto t_decode_end = Clock::now();
 
         const int batch = static_cast<int>(input_tensor.shape(input_tensor.layout().batch_index()));
         const int width = static_cast<int>(input_tensor.shape("W"));
         const int height = static_cast<int>(input_tensor.shape("H"));
 
+        const auto t_alloc_start = Clock::now();
         roccv::Tensor output_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_RGB8, eDeviceType::GPU);
+        roccv::Tensor resized_tensor(batch, roccv::Size2D{width * 2, height * 2}, roccv::FMT_RGB8, eDeviceType::GPU);
+        const auto t_alloc_end = Clock::now();
 
         hipStream_t stream{};
         HIP_VALIDATE_NO_ERRORS(hipStreamCreate(&stream));
 
+        const auto t_flip_start = Clock::now();
         roccv::Flip flip;
-        flip(stream, input_tensor, output_tensor, 1, eDeviceType::GPU);
-
+        roccv::Resize resize;
+        flip(stream, input_tensor, output_tensor, -1, eDeviceType::GPU);
+        resize(stream, output_tensor, resized_tensor, eInterpolationType::INTERP_TYPE_LINEAR, eDeviceType::GPU);
         HIP_VALIDATE_NO_ERRORS(hipStreamSynchronize(stream));
-        std::cout << "Synchronized stream" << std::endl;
+        const auto t_flip_end = Clock::now();
+
         HIP_VALIDATE_NO_ERRORS(hipStreamDestroy(stream));
 
+        const auto t_write_start = Clock::now();
         for (int i = 0; i < batch; ++i) {
             const std::string output_path = FlippedOutputPath(input_paths[i], output_dir);
-            WriteRgbTensorSliceToImageFile(output_tensor, i, output_path);
+            WriteRgbTensorSliceToImageFile(resized_tensor, i, output_path);
         }
+        const auto t_write_end = Clock::now();
         std::cout << "Wrote " << batch << " images to " << output_dir.string() << std::endl;
+
+        const double decode_ms = ElapsedMs(t_decode_start, t_decode_end);
+        const double flip_ms = ElapsedMs(t_flip_start, t_flip_end);
+        const double write_ms = ElapsedMs(t_write_start, t_write_end);
+        const double total_ms = ElapsedMs(t_loader_start, t_write_end);
+
+        std::cout << "\nTimings (" << batch << " image" << (batch == 1 ? "" : "s") << " @ " << width << "x" << height
+                  << "):" << std::endl;
+        PrintTiming("rocJPEG init", ElapsedMs(t_loader_start, t_loader_end));
+        PrintTiming("List inputs", ElapsedMs(t_list_start, t_list_end));
+        PrintTiming("Decode (batched)", decode_ms);
+        PrintTiming("  per image", decode_ms / batch);
+        PrintTiming("Output tensor alloc", ElapsedMs(t_alloc_start, t_alloc_end));
+        PrintTiming("Flip + stream sync", flip_ms);
+        PrintTiming("  per image", flip_ms / batch);
+        PrintTiming("Write PNGs", write_ms);
+        PrintTiming("  per image", write_ms / batch);
+        PrintTiming("Total", total_ms);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return EXIT_FAILURE;
