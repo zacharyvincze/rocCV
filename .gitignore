@@ -1,6 +1,15 @@
 # Miscellaneous
 .notes
 
+# LLM / AI assistant files
+CLAUDE.md
+.claude/
+.cursor/
+.copilot/
+.github/copilot-instructions.md
+.aider*
+AGENTS.md
+
 # Build files
 .build/
 build
