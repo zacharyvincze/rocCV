@@ -1,3 +1,10 @@
+/**
+ * @file rocjpeg_sample.cpp
+ * @brief End-to-end sample: GPU-decode JPEGs with rocJPEG, run roccv operators (Flip + Resize) on the result, then
+ *        write the output back to disk via OpenCV. Accepts either a single .jpg file or a directory of equal-sized
+ *        JPEGs (decoded as a single rocJPEG batch).
+ */
+
 #include <core/hip_assert.h>
 
 #include <chrono>
@@ -16,6 +23,128 @@
 
 namespace {
 
+// =====================================================================================================================
+// Constants
+// =====================================================================================================================
+
+/** Default subdirectory (created in the current working directory) for flipped + resized outputs. */
+constexpr const char* kDefaultOutputDirName = "rocjpeg_flipped_output";
+
+/** Output upscale factor applied by the resize operator after flipping. */
+constexpr int kResizeFactor = 2;
+
+// =====================================================================================================================
+// Timing helpers
+// =====================================================================================================================
+
+using Clock = std::chrono::steady_clock;
+
+/**
+ * @brief Returns the elapsed time between two clock points in milliseconds.
+ *
+ * @param start Earlier time point.
+ * @param end   Later time point.
+ * @return Elapsed wall-clock time in milliseconds (double precision).
+ */
+double ElapsedMs(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+/**
+ * @brief Prints a single labelled timing line to stdout, formatted as a uniform two-column row.
+ *
+ * @param label Short human-readable label describing the measured step.
+ * @param ms    Elapsed time in milliseconds.
+ */
+void PrintTiming(const char* label, double ms) {
+    std::cout << "  " << std::left << std::setw(28) << label << std::right << std::fixed << std::setprecision(3)
+              << std::setw(10) << ms << " ms" << std::endl;
+}
+
+// =====================================================================================================================
+// Path / CLI helpers
+// =====================================================================================================================
+
+/**
+ * @brief Builds an output path of the form `<output_dir>/<input_stem>_flipped.png`.
+ *
+ * @param input_path Path to the original input image; only its filename stem is used.
+ * @param output_dir Directory the output should be written into.
+ * @return Fully-qualified output path string.
+ */
+std::string FlippedOutputPath(const std::string& input_path, const std::filesystem::path& output_dir) {
+    std::filesystem::path in_p(input_path);
+    return (output_dir / (in_p.stem().string() + "_flipped.png")).string();
+}
+
+/**
+ * @brief Prints CLI usage information.
+ *
+ * @param prog Program name (typically `argv[0]`).
+ * @param os   Stream to print to (use `std::cout` for `--help`, `std::cerr` for usage errors).
+ */
+void PrintUsage(const char* prog, std::ostream& os) {
+    os << "Usage: " << prog << " <image.jpg|directory> [output_directory]\n"
+       << "  -h, --help         Show this message and exit.\n"
+       << "  <input>            Path to a single .jpg/.jpeg file or a directory of them.\n"
+       << "                     Directory inputs are batch-decoded; all images must share dimensions.\n"
+       << "  [output_directory] Directory to write <stem>_flipped.png files into.\n"
+       << "                     Defaults to ./" << kDefaultOutputDirName << " in the current working directory."
+       << std::endl;
+}
+
+/**
+ * @brief Creates the output directory (recursively) if it doesn't exist and verifies it is a directory.
+ *
+ * @param dir Directory path to ensure.
+ * @throws std::runtime_error If the directory cannot be created or `dir` exists as a non-directory.
+ */
+void EnsureOutputDirectory(const std::filesystem::path& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        throw std::runtime_error("failed to create output directory '" + dir.string() + "': " + ec.message());
+    }
+    if (!std::filesystem::is_directory(dir)) {
+        throw std::runtime_error("output path is not a directory: " + dir.string());
+    }
+}
+
+/**
+ * @brief Resolves the CLI input argument into a list of JPEG paths to decode.
+ *
+ * If `input_arg` is a directory, returns all `.jpg`/`.jpeg` entries within it (sorted). If it is a regular file,
+ * returns a single-element vector containing that file.
+ *
+ * @param input_arg User-supplied input path (file or directory).
+ * @return Ordered list of JPEG paths to feed to the loader.
+ * @throws std::runtime_error If the input directory contains no JPEG files.
+ */
+std::vector<std::string> ResolveInputPaths(const std::string& input_arg) {
+    if (std::filesystem::is_directory(input_arg)) {
+        auto paths = RocJpegLoader::listJpegFiles(input_arg);
+        if (paths.empty()) {
+            throw std::runtime_error("No .jpg/.jpeg files found in directory: " + input_arg);
+        }
+        std::cout << "Batch decoding " << paths.size() << " images from " << input_arg << std::endl;
+        return paths;
+    }
+    return {input_arg};
+}
+
+// =====================================================================================================================
+// Tensor → image-file I/O
+// =====================================================================================================================
+
+/**
+ * @brief Copies a single image (slice `batch_idx`) of an NHWC RGB8 tensor from device memory to host and writes it as
+ *        an image file via OpenCV (output is converted from RGB to BGR before writing).
+ *
+ * @param tensor    NHWC RGB8 source tensor on the GPU.
+ * @param batch_idx Zero-based index of the image within the batch to write.
+ * @param path      Destination image path (extension determines the encoder used by OpenCV).
+ * @throws std::runtime_error If OpenCV fails to write the file.
+ */
 void WriteRgbTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, const std::string& path) {
     auto data = tensor.exportData<roccv::TensorDataStrided>();
     const auto& layout = tensor.layout();
@@ -38,37 +167,14 @@ void WriteRgbTensorSliceToImageFile(const roccv::Tensor& tensor, int batch_idx, 
     }
 }
 
-std::string FlippedOutputPath(const std::string& input_path, const std::filesystem::path& output_dir) {
-    std::filesystem::path in_p(input_path);
-    return (output_dir / (in_p.stem().string() + "_flipped.png")).string();
-}
-
-constexpr const char* kDefaultOutputDirName = "rocjpeg_flipped_output";
-
-using Clock = std::chrono::steady_clock;
-
-double ElapsedMs(Clock::time_point start, Clock::time_point end) {
-    return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
-void PrintTiming(const char* label, double ms) {
-    std::cout << "  " << std::left << std::setw(28) << label << std::right << std::fixed << std::setprecision(3)
-              << std::setw(10) << ms << " ms" << std::endl;
-}
-
-void PrintUsage(const char* prog, std::ostream& os) {
-    os << "Usage: " << prog << " <image.jpg|directory> [output_directory]\n"
-       << "  -h, --help         Show this message and exit.\n"
-       << "  <input>            Path to a single .jpg/.jpeg file or a directory of them.\n"
-       << "                     Directory inputs are batch-decoded; all images must share dimensions.\n"
-       << "  [output_directory] Directory to write <stem>_flipped.png files into.\n"
-       << "                     Defaults to ./" << kDefaultOutputDirName << " in the current working directory."
-       << std::endl;
-}
-
 }  // namespace
 
+// =====================================================================================================================
+// Entry point
+// =====================================================================================================================
+
 int main(int argc, char** argv) {
+    // Help flag — checked before arg-count validation so `--help` works regardless of position.
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "-h" || arg == "--help") {
@@ -83,42 +189,23 @@ int main(int argc, char** argv) {
     }
 
     const std::string input_arg(argv[1]);
-    const bool input_is_directory = std::filesystem::is_directory(input_arg);
     const std::filesystem::path output_dir =
         (argc == 3) ? std::filesystem::path(argv[2]) : std::filesystem::current_path() / kDefaultOutputDirName;
 
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(output_dir, ec);
-        if (ec) {
-            std::cerr << "Error: failed to create output directory '" << output_dir.string() << "': " << ec.message()
-                      << std::endl;
-            return EXIT_FAILURE;
-        }
-        if (!std::filesystem::is_directory(output_dir)) {
-            std::cerr << "Error: output path is not a directory: " << output_dir.string() << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-
     try {
+        EnsureOutputDirectory(output_dir);
+
+        // ----------------------------------------------------------------------------------------- rocJPEG init
         const auto t_loader_start = Clock::now();
         RocJpegLoader loader(ROCJPEG_BACKEND_HARDWARE, 0);
         const auto t_loader_end = Clock::now();
 
+        // ----------------------------------------------------------------------------------------- list inputs
         const auto t_list_start = Clock::now();
-        std::vector<std::string> input_paths;
-        if (input_is_directory) {
-            input_paths = RocJpegLoader::listJpegFiles(input_arg);
-            if (input_paths.empty()) {
-                throw std::runtime_error("No .jpg/.jpeg files found in directory: " + input_arg);
-            }
-            std::cout << "Batch decoding " << input_paths.size() << " images from " << input_arg << std::endl;
-        } else {
-            input_paths.push_back(input_arg);
-        }
+        const std::vector<std::string> input_paths = ResolveInputPaths(input_arg);
         const auto t_list_end = Clock::now();
 
+        // ----------------------------------------------------------------------------------------- decode (batched)
         const auto t_decode_start = Clock::now();
         roccv::Tensor input_tensor = loader.loadTensor(input_paths);
         const auto t_decode_end = Clock::now();
@@ -127,24 +214,29 @@ int main(int argc, char** argv) {
         const int width = static_cast<int>(input_tensor.shape("W"));
         const int height = static_cast<int>(input_tensor.shape("H"));
 
+        // ----------------------------------------------------------------------------------------- alloc outputs
         const auto t_alloc_start = Clock::now();
-        roccv::Tensor output_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_RGB8, eDeviceType::GPU);
-        roccv::Tensor resized_tensor(batch, roccv::Size2D{width * 2, height * 2}, roccv::FMT_RGB8, eDeviceType::GPU);
+        roccv::Tensor flipped_tensor(batch, roccv::Size2D{width, height}, roccv::FMT_RGB8, eDeviceType::GPU);
+        roccv::Tensor resized_tensor(batch, roccv::Size2D{width * kResizeFactor, height * kResizeFactor},
+                                     roccv::FMT_RGB8, eDeviceType::GPU);
         const auto t_alloc_end = Clock::now();
 
         hipStream_t stream{};
         HIP_VALIDATE_NO_ERRORS(hipStreamCreate(&stream));
 
-        const auto t_flip_start = Clock::now();
+        // ----------------------------------------------------------------------------------------- flip + resize
         roccv::Flip flip;
         roccv::Resize resize;
-        flip(stream, input_tensor, output_tensor, -1, eDeviceType::GPU);
-        resize(stream, output_tensor, resized_tensor, eInterpolationType::INTERP_TYPE_LINEAR, eDeviceType::GPU);
+
+        const auto t_ops_start = Clock::now();
+        flip(stream, input_tensor, flipped_tensor, -1, eDeviceType::GPU);
+        resize(stream, flipped_tensor, resized_tensor, eInterpolationType::INTERP_TYPE_LINEAR, eDeviceType::GPU);
         HIP_VALIDATE_NO_ERRORS(hipStreamSynchronize(stream));
-        const auto t_flip_end = Clock::now();
+        const auto t_ops_end = Clock::now();
 
         HIP_VALIDATE_NO_ERRORS(hipStreamDestroy(stream));
 
+        // ----------------------------------------------------------------------------------------- write outputs
         const auto t_write_start = Clock::now();
         for (int i = 0; i < batch; ++i) {
             const std::string output_path = FlippedOutputPath(input_paths[i], output_dir);
@@ -153,8 +245,9 @@ int main(int argc, char** argv) {
         const auto t_write_end = Clock::now();
         std::cout << "Wrote " << batch << " images to " << output_dir.string() << std::endl;
 
+        // ----------------------------------------------------------------------------------------- timing summary
         const double decode_ms = ElapsedMs(t_decode_start, t_decode_end);
-        const double flip_ms = ElapsedMs(t_flip_start, t_flip_end);
+        const double ops_ms = ElapsedMs(t_ops_start, t_ops_end);
         const double write_ms = ElapsedMs(t_write_start, t_write_end);
         const double total_ms = ElapsedMs(t_loader_start, t_write_end);
 
@@ -165,8 +258,8 @@ int main(int argc, char** argv) {
         PrintTiming("Decode (batched)", decode_ms);
         PrintTiming("  per image", decode_ms / batch);
         PrintTiming("Output tensor alloc", ElapsedMs(t_alloc_start, t_alloc_end));
-        PrintTiming("Flip + stream sync", flip_ms);
-        PrintTiming("  per image", flip_ms / batch);
+        PrintTiming("Flip + Resize + sync", ops_ms);
+        PrintTiming("  per image", ops_ms / batch);
         PrintTiming("Write PNGs", write_ms);
         PrintTiming("  per image", write_ms / batch);
         PrintTiming("Total", total_ms);
