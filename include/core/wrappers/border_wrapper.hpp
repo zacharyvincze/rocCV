@@ -166,6 +166,14 @@ class BorderWrapper {
      */
     __device__ __host__ inline int64_t channels() const { return m_desc.channels(); }
 
+    /**
+     * @brief Exposes the underlying (border-unaware) ImageWrapper. Useful for fast paths that, after handling the
+     * border region separately, want a raw row pointer into the in-bounds source via ImageWrapper::at.
+     *
+     * @return A reference to the wrapped ImageWrapper.
+     */
+    __device__ __host__ inline ImageWrapper<T>& inner() { return m_desc; }
+
    private:
     ImageWrapper<T> m_desc;
     T m_border_value;
