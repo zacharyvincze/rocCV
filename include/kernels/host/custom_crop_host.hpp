@@ -24,18 +24,39 @@ THE SOFTWARE.
 
 #include <hip/hip_runtime.h>
 
+#include <cstring>
+
 #include "operator_types.h"
 
 namespace Kernels {
 namespace Host {
 template <typename SrcWrapper, typename DstWrapper>
 void custom_crop(SrcWrapper input, DstWrapper output, roccv::Box_t cropRect) {
-    for (int b = 0; b < output.batches(); b++) {
-        for (int i = 0; i < cropRect.width; i++) {
-            for (int j = 0; j < cropRect.height; j++) {
-                int sourceX = i + cropRect.x;
-                int sourceY = j + cropRect.y;
-                output.at(b, j, i, 0) = input.at(b, sourceY, sourceX, 0);
+    using T = typename DstWrapper::ValueType;
+
+    const int batches = static_cast<int>(output.batches());
+    const int cropX = cropRect.x;
+    const int cropY = cropRect.y;
+    const int cropW = cropRect.width;
+    const int cropH = cropRect.height;
+
+    // Each output row is a verbatim, contiguous span of the corresponding source row [cropX, cropX+cropW); when rows
+    // are packed it collapses to a single memcpy instead of a per-pixel copy.
+    const bool contiguous = input.isRowContiguous() && output.isRowContiguous();
+
+    // Collapse batch and row so work scales even when batch == 1 (HWC); rows are uniform, so schedule statically.
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batches; b++) {
+        for (int j = 0; j < cropH; j++) {
+            const int sourceY = j + cropY;
+            if (contiguous) {
+                const T* __restrict__ inRow = &input.at(b, sourceY, cropX, 0);
+                T* __restrict__ outRow = &output.at(b, j, 0, 0);
+                std::memcpy(outRow, inRow, static_cast<size_t>(cropW) * sizeof(T));
+            } else {
+                for (int i = 0; i < cropW; i++) {
+                    output.at(b, j, i, 0) = input.at(b, sourceY, i + cropX, 0);
+                }
             }
         }
     }
