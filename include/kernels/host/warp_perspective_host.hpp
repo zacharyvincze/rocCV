@@ -24,17 +24,31 @@ THE SOFTWARE.
 
 #include <hip/hip_runtime.h>
 
+#include <limits>
+
 namespace Kernels {
 namespace Host {
 template <typename SrcWrapper, typename DstWrapper, typename Mat>
 void warp_perspective(SrcWrapper input, DstWrapper output, Mat mat) {
-    for (int b = 0; b < output.batches(); b++) {
-        for (int y = 0; y < output.height(); y++) {
-            for (int x = 0; x < output.width(); x++) {
-                const float denom = mat[6] * x + mat[7] * y + mat[8];
+    const int batches = static_cast<int>(output.batches());
+    const int height = static_cast<int>(output.height());
+    const int width = static_cast<int>(output.width());
+
+    // Collapse batch and row so work scales even when batch == 1 (HWC); rows are uniform, so schedule statically.
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batches; b++) {
+        for (int y = 0; y < height; y++) {
+            // The matrix * y products are constant across the row. Hoist them, but keep them as separate addends so the
+            // per-pixel expression stays bit-identical to the device kernel (the golden model compares byte-for-byte).
+            const float m1y = mat[1] * y;
+            const float m4y = mat[4] * y;
+            const float m7y = mat[7] * y;
+
+            for (int x = 0; x < width; x++) {
+                const float denom = mat[6] * x + m7y + mat[8];
                 const float coeff = denom == 0.0 ? std::numeric_limits<float>::max() : 1.0f / denom;
-                const float ox = (mat[0] * x + mat[1] * y + mat[2]) * coeff;
-                const float oy = (mat[3] * x + mat[4] * y + mat[5]) * coeff;
+                const float ox = (mat[0] * x + m1y + mat[2]) * coeff;
+                const float oy = (mat[3] * x + m4y + mat[5]) * coeff;
                 output.at(b, y, x, 0) = input.at(b, oy, ox, 0);
             }
         }
