@@ -32,128 +32,87 @@ THE SOFTWARE.
 
 namespace Kernels {
 namespace Host {
-template <typename SrcWrapper, typename DstWrapper>
-void binary_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh,
-                    roccv::GenericTensorWrapper<double> maxVal) {
+namespace detail {
+/**
+ * @brief Shared skeleton for every thresholding variant: OMP-parallel over batch + row with a contiguous fast path and
+ * a strided fallback. `op(ip, th, mv)` computes a single channel's thresholded value in double precision; modes without
+ * a max value simply ignore `mv`. thresh/maxVal are per-batch broadcasts, resolved once per row.
+ */
+template <typename SrcWrapper, typename DstWrapper, typename Op>
+inline void threshold_apply(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh,
+                            roccv::GenericTensorWrapper<double> maxVal, Op op) {
     using namespace roccv::detail;
     using src_type = typename SrcWrapper::ValueType;
     using dst_type = typename DstWrapper::ValueType;
     using base_type = BaseType<dst_type>;
+    constexpr int kChannels = NumElements<dst_type>;  // Compile-time channel count enables the inner loop to unroll.
 
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        double th = thresh.at(z_idx);
-        double mv = maxVal.at(z_idx);
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                src_type inputVal = input.at(z_idx, y_idx, x_idx, 0);
-                dst_type outputVal;
-                for (int i = 0; i < output.channels(); i++) {
-                    double ip = StaticCast<double>(GetElement(inputVal, i));
-                    double outVal = ip > th ? mv : 0;
-                    GetElement(outputVal, i) = StaticCast<base_type>(outVal);
-                }
-                output.at(z_idx, y_idx, x_idx, 0) = outputVal;
+    const int batches = static_cast<int>(output.batches());
+    const int height = static_cast<int>(output.height());
+    const int width = static_cast<int>(output.width());
+
+    // Each pixel is independent, so packed rows become unit-stride, vectorizable walks.
+    const bool contiguous = input.isRowContiguous() && output.isRowContiguous();
+
+    // Single-sourced per-pixel formula shared by both the fast path and the strided fallback.
+    auto computePixel = [&](src_type in, double th, double mv) -> dst_type {
+        dst_type out;
+        for (int i = 0; i < kChannels; i++) {
+            double ip = StaticCast<double>(GetElement(in, i));
+            GetElement(out, i) = StaticCast<base_type>(op(ip, th, mv));
+        }
+        return out;
+    };
+
+    // Collapse batch and row so work scales even when batch == 1 (HWC); rows are uniform, so schedule statically.
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batches; b++) {
+        for (int y = 0; y < height; y++) {
+            const double th = thresh.at(b);
+            const double mv = maxVal.at(b);
+            if (contiguous) {
+                const src_type* __restrict__ inRow = &input.at(b, y, 0, 0);
+                dst_type* __restrict__ outRow = &output.at(b, y, 0, 0);
+                for (int x = 0; x < width; x++) outRow[x] = computePixel(inRow[x], th, mv);
+            } else {
+                for (int x = 0; x < width; x++) output.at(b, y, x, 0) = computePixel(input.at(b, y, x, 0), th, mv);
             }
         }
     }
+}
+}  // namespace detail
+
+template <typename SrcWrapper, typename DstWrapper>
+void binary_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh,
+                    roccv::GenericTensorWrapper<double> maxVal) {
+    detail::threshold_apply(input, output, thresh, maxVal,
+                            [](double ip, double th, double mv) { return ip > th ? mv : 0.0; });
 }
 
 template <typename SrcWrapper, typename DstWrapper>
 void binary_inv_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh,
                         roccv::GenericTensorWrapper<double> maxVal) {
-    using namespace roccv::detail;
-    using src_type = typename SrcWrapper::ValueType;
-    using dst_type = typename DstWrapper::ValueType;
-    using base_type = BaseType<dst_type>;
-
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        double th = thresh.at(z_idx);
-        double mv = maxVal.at(z_idx);
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                src_type inputVal = input.at(z_idx, y_idx, x_idx, 0);
-                dst_type outputVal;
-                for (int i = 0; i < output.channels(); i++) {
-                    double ip = StaticCast<double>(GetElement(inputVal, i));
-                    double outVal = ip > th ? 0 : mv;
-                    GetElement(outputVal, i) = StaticCast<base_type>(outVal);
-                }
-                output.at(z_idx, y_idx, x_idx, 0) = outputVal;
-            }
-        }
-    }
+    detail::threshold_apply(input, output, thresh, maxVal,
+                            [](double ip, double th, double mv) { return ip > th ? 0.0 : mv; });
 }
 
 template <typename SrcWrapper, typename DstWrapper>
 void trunc_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh) {
-    using namespace roccv::detail;
-    using src_type = typename SrcWrapper::ValueType;
-    using dst_type = typename DstWrapper::ValueType;
-    using base_type = BaseType<dst_type>;
-
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        double th = thresh.at(z_idx);
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                src_type inputVal = input.at(z_idx, y_idx, x_idx, 0);
-                dst_type outputVal;
-                for (int i = 0; i < output.channels(); i++) {
-                    double ip = StaticCast<double>(GetElement(inputVal, i));
-                    double outVal = ip > th ? th : ip;
-                    GetElement(outputVal, i) = StaticCast<base_type>(outVal);
-                }
-                output.at(z_idx, y_idx, x_idx, 0) = outputVal;
-            }
-        }
-    }
+    // No max value for this mode; pass `thresh` as a harmless stand-in since the op ignores mv.
+    detail::threshold_apply(input, output, thresh, thresh,
+                            [](double ip, double th, double /*mv*/) { return ip > th ? th : ip; });
 }
 
 template <typename SrcWrapper, typename DstWrapper>
 void tozero_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh) {
-    using namespace roccv::detail;
-    using src_type = typename SrcWrapper::ValueType;
-    using dst_type = typename DstWrapper::ValueType;
-    using base_type = BaseType<dst_type>;
-
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        double th = thresh.at(z_idx);
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                src_type inputVal = input.at(z_idx, y_idx, x_idx, 0);
-                dst_type outputVal;
-                for (int i = 0; i < output.channels(); i++) {
-                    double ip = StaticCast<double>(GetElement(inputVal, i));
-                    double outVal = ip > th ? ip : 0;
-                    GetElement(outputVal, i) = StaticCast<base_type>(outVal);
-                }
-                output.at(z_idx, y_idx, x_idx, 0) = outputVal;
-            }
-        }
-    }
+    detail::threshold_apply(input, output, thresh, thresh,
+                            [](double ip, double th, double /*mv*/) { return ip > th ? ip : 0.0; });
 }
 
 template <typename SrcWrapper, typename DstWrapper>
 void tozeroinv_generic(SrcWrapper input, DstWrapper output, roccv::GenericTensorWrapper<double> thresh) {
-    using namespace roccv::detail;
-    using src_type = typename SrcWrapper::ValueType;
-    using dst_type = typename DstWrapper::ValueType;
-    using base_type = BaseType<dst_type>;
-
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        double th = thresh.at(z_idx);
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                src_type inputVal = input.at(z_idx, y_idx, x_idx, 0);
-                dst_type outputVal;
-                for (int i = 0; i < output.channels(); i++) {
-                    double ip = StaticCast<double>(GetElement(inputVal, i));
-                    double outVal = ip > th ? 0 : ip;
-                    GetElement(outputVal, i) = StaticCast<base_type>(outVal);
-                }
-                output.at(z_idx, y_idx, x_idx, 0) = outputVal;
-            }
-        }
-    }
+    detail::threshold_apply(input, output, thresh, thresh,
+                            [](double ip, double th, double /*mv*/) { return ip > th ? 0.0 : ip; });
 }
 }  // namespace Host
 }  // namespace Kernels
