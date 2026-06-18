@@ -31,7 +31,6 @@
 #include "core/detail/casting.hpp"
 #include "core/detail/math/vectorized_type_math.hpp"
 #include "core/detail/type_traits.hpp"
-#include "core/detail/vector_utils.hpp"
 
 namespace Kernels::Host {
 template <bool ScaleStddev, typename SrcWrapper, typename DstWrapper, typename ScaleWrapper, typename BaseWrapper>
@@ -39,40 +38,69 @@ void normalize(SrcWrapper input, BaseWrapper base, ScaleWrapper scale, DstWrappe
                float shift, float epsilon) {
     using namespace roccv::detail;
     using work_type = MakeType<float, NumComponents<typename SrcWrapper::ValueType>>;
-    using result_type = DstWrapper::ValueType;
+    using result_type = typename DstWrapper::ValueType;
 
-// Split work across available threads for the batch dimension of the images. By default, OpenMP will use the maximum
-// available threads on the system unless set otherwise.
-#pragma omp parallel for
-    for (int b = 0; b < output.batches(); b++) {
-        for (int y = 0; y < output.height(); y++) {
-            for (int x = 0; x < output.width(); x++) {
-                const int baseBatchIdx = base.batches() == 1 ? 0 : b;
-                const int baseHeightIdx = base.height() == 1 ? 0 : y;
-                const int baseWidthIdx = base.width() == 1 ? 0 : x;
+    const int batches = static_cast<int>(output.batches());
+    const int height = static_cast<int>(output.height());
+    const int width = static_cast<int>(output.width());
 
-                const int scaleBatchIdx = scale.batches() == 1 ? 0 : b;
-                const int scaleHeightIdx = scale.height() == 1 ? 0 : y;
-                const int scaleWidthIdx = scale.width() == 1 ? 0 : x;
+    // base/scale are broadcastable along any of N/H/W (extent 1 means the index collapses to 0).
+    const bool baseBroadcastN = base.batches() == 1;
+    const bool baseBroadcastH = base.height() == 1;
+    const bool baseBroadcastW = base.width() == 1;
+    const bool scaleBroadcastN = scale.batches() == 1;
+    const bool scaleBroadcastH = scale.height() == 1;
+    const bool scaleBroadcastW = scale.width() == 1;
 
-                work_type scaleVal;
-                work_type s = StaticCast<work_type>(scale.at(scaleBatchIdx, scaleHeightIdx, scaleWidthIdx, 0));
-                if constexpr (ScaleStddev) {
-                    // Scale tensor is the standard deviation, invert back to scale with epsilon added to avoid division
-                    // by zero.
-                    scaleVal = 1.0f / (math::vsqrtf((s * s) + epsilon));
-                } else {
-                    // Scale tensor remains normal, calculate assuming the values in the scale tensor are indeed the
-                    // scale
-                    scaleVal = s;
+    // Convert a scale sample to a multiplier, inverting standard deviations (epsilon guards against /0).
+    auto resolveScale = [&](const work_type& s) -> work_type {
+        if constexpr (ScaleStddev) {
+            return 1.0f / (math::vsqrtf((s * s) + epsilon));
+        } else {
+            return s;
+        }
+    };
+
+    // Single-sourced per-pixel formula shared by both the contiguous fast path and the strided fallback.
+    auto computePixel = [&](const work_type& in, const work_type& baseVal, const work_type& scaleVal) -> result_type {
+        return SaturateCast<result_type>((in - baseVal) * scaleVal * globalScale + shift);
+    };
+
+    // Collapse batch and row so work scales even when batch == 1 (HWC); rows are uniform, so schedule statically.
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batches; b++) {
+        for (int y = 0; y < height; y++) {
+            const int baseBatchIdx = baseBroadcastN ? 0 : b;
+            const int baseHeightIdx = baseBroadcastH ? 0 : y;
+            const int scaleBatchIdx = scaleBroadcastN ? 0 : b;
+            const int scaleHeightIdx = scaleBroadcastH ? 0 : y;
+
+            // If base/scale don't vary across the row, resolve them once per row (hoists the stddev sqrt).
+            work_type rowScale{};
+            work_type rowBase{};
+            if (scaleBroadcastW)
+                rowScale = resolveScale(StaticCast<work_type>(scale.at(scaleBatchIdx, scaleHeightIdx, 0, 0)));
+            if (baseBroadcastW) rowBase = StaticCast<work_type>(base.at(baseBatchIdx, baseHeightIdx, 0, 0));
+
+            // Fast path: packed rows with row-constant base/scale become a unit-stride, vectorizable loop.
+            if (scaleBroadcastW && baseBroadcastW && input.isRowContiguous() && output.isRowContiguous()) {
+                const typename SrcWrapper::ValueType* __restrict__ inRow = &input.at(b, y, 0, 0);
+                result_type* __restrict__ outRow = &output.at(b, y, 0, 0);
+                for (int x = 0; x < width; x++) {
+                    outRow[x] = computePixel(StaticCast<work_type>(inRow[x]), rowBase, rowScale);
                 }
-                work_type result = (StaticCast<work_type>(input.at(b, y, x, 0)) -
-                                    StaticCast<work_type>(base.at(baseBatchIdx, baseHeightIdx, baseWidthIdx, 0))) *
-                                       scaleVal * globalScale +
-                                   shift;
+            } else {
+                for (int x = 0; x < width; x++) {
+                    const work_type scaleVal =
+                        scaleBroadcastW
+                            ? rowScale
+                            : resolveScale(StaticCast<work_type>(scale.at(scaleBatchIdx, scaleHeightIdx, x, 0)));
+                    const work_type baseVal =
+                        baseBroadcastW ? rowBase : StaticCast<work_type>(base.at(baseBatchIdx, baseHeightIdx, x, 0));
 
-                // Saturate cast value back into the output tensor's value type
-                output.at(b, y, x, 0) = SaturateCast<result_type>(result);
+                    output.at(b, y, x, 0) =
+                        computePixel(StaticCast<work_type>(input.at(b, y, x, 0)), baseVal, scaleVal);
+                }
             }
         }
     }

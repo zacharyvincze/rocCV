@@ -133,8 +133,14 @@ class ImageWrapper {
     }
 
     __device__ __host__ const T at(int64_t n, int64_t h, int64_t w, int64_t c) const {
-        return *(reinterpret_cast<T*>(data + (stride.n * n) + (stride.h * h) + (stride.w * w) + (stride.c * c)));
+        return const_cast<ImageWrapper*>(this)->at(n, h, w, c);
     }
+
+    /**
+     * @brief True when pixels within a row are densely packed (width stride equals the element size), so a row
+     * pointer from &at(n, h, 0, 0) can be walked as a unit-stride array; otherwise fall back to at().
+     */
+    __device__ __host__ inline bool isRowContiguous() const { return stride.w == static_cast<int64_t>(sizeof(T)); }
 
     /**
      * @brief Retrives the height of the images.
