@@ -32,21 +32,34 @@ void flip(SrcWrapper input, DstWrapper output) {
     const int width = static_cast<int>(output.width());
     const int height = static_cast<int>(output.height());
 
+    // Row-pointer walks (memcpy / [x] indexing) are only valid when rows are densely packed; otherwise fall back to
+    // strided at() accesses.
+    const bool contiguous = input.isRowContiguous() && output.isRowContiguous();
+
 #pragma omp parallel for collapse(2) schedule(static)
     for (int b = 0; b < output.batches(); b++) {
         for (int y = 0; y < height; y++) {
             // For an X/BOTH flip the source row is mirrored vertically; otherwise it matches the output row.
             const int srcY = (FlipType == eAxis::X || FlipType == eAxis::BOTH) ? height - y - 1 : y;
-            const T* __restrict__ inRow = &input.at(b, srcY, 0, 0);
-            T* __restrict__ outRow = &output.at(b, y, 0, 0);
 
-            if constexpr (FlipType == eAxis::X) {
-                // No horizontal change: copy the contiguous row wholesale.
-                std::memcpy(outRow, inRow, static_cast<size_t>(width) * sizeof(T));
+            if (contiguous) {
+                const T* __restrict__ inRow = &input.at(b, srcY, 0, 0);
+                T* __restrict__ outRow = &output.at(b, y, 0, 0);
+
+                if constexpr (FlipType == eAxis::X) {
+                    // No horizontal change: copy the contiguous row wholesale.
+                    std::memcpy(outRow, inRow, static_cast<size_t>(width) * sizeof(T));
+                } else {
+                    // Y or BOTH: mirror the row horizontally.
+                    for (int x = 0; x < width; x++) {
+                        outRow[x] = inRow[width - 1 - x];
+                    }
+                }
             } else {
-                // Y or BOTH: mirror the row horizontally.
+                // Strided fallback: X keeps the column index, Y/BOTH mirror it. srcY already handles the vertical flip.
                 for (int x = 0; x < width; x++) {
-                    outRow[x] = inRow[width - 1 - x];
+                    const int srcX = (FlipType == eAxis::X) ? x : width - 1 - x;
+                    output.at(b, y, x, 0) = input.at(b, srcY, srcX, 0);
                 }
             }
         }
