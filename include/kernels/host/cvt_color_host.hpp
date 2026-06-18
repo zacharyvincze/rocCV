@@ -29,30 +29,56 @@ THE SOFTWARE.
 
 namespace Kernels::Host {
 
+/**
+ * @brief Shared skeleton for the elementwise color conversions: OMP-parallel over batch + row with a contiguous fast
+ * path and a strided fallback. `perPixel` maps one source pixel to one destination pixel. Kept in Kernels::Host (rather
+ * than a nested detail namespace) because the callers pull in `using namespace roccv;`, which would make a `detail`
+ * namespace name ambiguous with roccv::detail.
+ */
+template <typename SrcWrapper, typename DstWrapper, typename Op>
+inline void cvt_apply(SrcWrapper input, DstWrapper output, Op perPixel) {
+    using in_type = typename SrcWrapper::ValueType;
+    using out_type = typename DstWrapper::ValueType;
+
+    const int batches = static_cast<int>(output.batches());
+    const int height = static_cast<int>(output.height());
+    const int width = static_cast<int>(output.width());
+
+    // Each pixel is independent, so packed rows become unit-stride, vectorizable walks.
+    const bool contiguous = input.isRowContiguous() && output.isRowContiguous();
+
+    // Collapse batch and row so work scales even when batch == 1 (HWC); rows are uniform, so schedule statically.
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batches; b++) {
+        for (int y = 0; y < height; y++) {
+            if (contiguous) {
+                const in_type* __restrict__ inRow = &input.at(b, y, 0, 0);
+                out_type* __restrict__ outRow = &output.at(b, y, 0, 0);
+                for (int x = 0; x < width; x++) outRow[x] = perPixel(inRow[x]);
+            } else {
+                for (int x = 0; x < width; x++) output.at(b, y, x, 0) = perPixel(input.at(b, y, x, 0));
+            }
+        }
+    }
+}
+
 template <typename T, roccv::eSwizzle S, typename SrcWrapper, typename DstWrapper>
 void rgb_or_bgr_to_yuv(SrcWrapper input, DstWrapper output, float delta) {
     using namespace roccv;
     using namespace roccv::detail;
-
     using work_type_t = MakeType<float, NumElements<T>>;
 
-#pragma omp parallel for
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                T val = Swizzle<S>(input.at(z_idx, y_idx, x_idx, 0));
-                work_type_t valF = StaticCast<work_type_t>(val);
+    cvt_apply(input, output, [delta](auto raw) {
+        T val = Swizzle<S>(raw);
+        work_type_t valF = StaticCast<work_type_t>(val);
 
-                float y = valF.x * 0.299f + valF.y * 0.587f + valF.z * 0.114f;
-                float cr = (valF.x - y) * 0.877f + delta;
-                float cb = (valF.z - y) * 0.492f + delta;
+        float y = valF.x * 0.299f + valF.y * 0.587f + valF.z * 0.114f;
+        float cr = (valF.x - y) * 0.877f + delta;
+        float cb = (valF.z - y) * 0.492f + delta;
 
-                work_type_t out = make_float3(y, cb, cr);
-
-                output.at(z_idx, y_idx, x_idx, 0) = SaturateCast<T>(out);
-            }
-        }
-    }
+        work_type_t out = make_float3(y, cb, cr);
+        return SaturateCast<T>(out);
+    });
 }
 
 template <typename T, roccv::eSwizzle S, typename SrcWrapper, typename DstWrapper>
@@ -61,37 +87,24 @@ void yuv_to_rgb_or_bgr(SrcWrapper input, DstWrapper output, float delta) {
     using namespace roccv::detail;
     using work_type_t = MakeType<float, NumElements<T>>;
 
-#pragma omp parallel for
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                T val = input.at(z_idx, y_idx, x_idx, 0);
-                work_type_t valF = StaticCast<work_type_t>(val);
+    cvt_apply(input, output, [delta](auto raw) {
+        work_type_t valF = StaticCast<work_type_t>(raw);
 
-                // Convert from YUV to RGB
-                work_type_t rgb = make_float3(valF.x + (valF.z - delta) * 1.140f,                                // R
-                                              valF.x + (valF.y - delta) * -0.395f + (valF.z - delta) * -0.581f,  // G
-                                              valF.x + (valF.y - delta) * 2.032f);                               // B
+        // Convert from YUV to RGB
+        work_type_t rgb = make_float3(valF.x + (valF.z - delta) * 1.140f,                                // R
+                                      valF.x + (valF.y - delta) * -0.395f + (valF.z - delta) * -0.581f,  // G
+                                      valF.x + (valF.y - delta) * 2.032f);                               // B
 
-                // Saturate cast to type T (this clamps to proper ranges)
-                output.at(z_idx, y_idx, x_idx, 0) = Swizzle<S>(SaturateCast<T>(rgb));
-            }
-        }
-    }
+        // Saturate cast to type T (this clamps to proper ranges)
+        return Swizzle<S>(SaturateCast<T>(rgb));
+    });
 }
 
 template <typename T, roccv::eSwizzle S, typename SrcWrapper, typename DstWrapper>
 void reorder(SrcWrapper input, DstWrapper output) {
     using namespace roccv::detail;
 
-#pragma omp parallel for
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                output.at(z_idx, y_idx, x_idx, 0) = Swizzle<S>(input.at(z_idx, y_idx, x_idx, 0));
-            }
-        }
-    }
+    cvt_apply(input, output, [](auto raw) { return Swizzle<S>(raw); });
 }
 
 template <typename T, roccv::eSwizzle S, typename SrcWrapper, typename DstWrapper>
@@ -100,19 +113,14 @@ void rgb_or_bgr_to_grayscale(SrcWrapper input, DstWrapper output) {
     using work_type_t = MakeType<float, NumElements<T>>;
     using out_type_t = MakeType<BaseType<T>, 1>;
 
-#pragma omp parallel for
-    for (int z_idx = 0; z_idx < output.batches(); z_idx++) {
-        for (int y_idx = 0; y_idx < output.height(); y_idx++) {
-            for (int x_idx = 0; x_idx < output.width(); x_idx++) {
-                T inVal = Swizzle<S>(input.at(z_idx, y_idx, x_idx, 0));
-                work_type_t inValF = StaticCast<work_type_t>(inVal);
+    cvt_apply(input, output, [](auto raw) {
+        T inVal = Swizzle<S>(raw);
+        work_type_t inValF = StaticCast<work_type_t>(inVal);
 
-                // Calculate luminance
-                float y = inValF.x * 0.299f + inValF.y * 0.587f + inValF.z * 0.114f;
+        // Calculate luminance
+        float y = inValF.x * 0.299f + inValF.y * 0.587f + inValF.z * 0.114f;
 
-                output.at(z_idx, y_idx, x_idx, 0) = SaturateCast<out_type_t>(y);
-            }
-        }
-    }
+        return SaturateCast<out_type_t>(y);
+    });
 }
 }  // namespace Kernels::Host
