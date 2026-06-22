@@ -26,12 +26,12 @@
 namespace Kernels::Host {
 template <typename SrcWrapper, typename DstWrapper>
 void resize(SrcWrapper input, DstWrapper output, float scaleX, float scaleY) {
-#pragma omp parallel for
+#pragma omp parallel for collapse(2) schedule(static)
     for (int batch = 0; batch < output.batches(); batch++) {
         for (int y = 0; y < output.height(); y++) {
+            const float srcY = fmaf(y + 0.5f, scaleY, -0.5f);
             for (int x = 0; x < output.width(); x++) {
-                float srcX = fmaf(x + 0.5f, scaleX, -0.5f);
-                float srcY = fmaf(y + 0.5f, scaleY, -0.5f);
+                const float srcX = fmaf(x + 0.5f, scaleX, -0.5f);
                 output.at(batch, y, x, 0) = input.at(batch, srcY, srcX, 0);
             }
         }
